@@ -37,6 +37,7 @@ lr = 1e-3 # This is the learning rate of the model
 eval_iters = 100 # This is the number of steps for which the model is evaluated on the cross-val set
 eval_interval = 100 # This is the interval after which the model is evaluated on the cross-val set
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+embd_size = 32 # This is the size of the embedding vector
 
 
 # This function will return a random batch of data of size batch_size and block_size
@@ -45,6 +46,8 @@ def get_batch(split):
     ix = torch.randint(len(data) - batch_size , (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1: i+block_size+1] for i in ix])
+    x = x.to(device)
+    y = y.to(device)
     return x,y
 
 # Evaluating the val and the train loss in intervals of eval_iters so that the loss curve is smooth 
@@ -68,13 +71,17 @@ class BigramLanguageModel(nn.Module):
     
     def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size , vocab_size)
-        
+        self.token_embedding_table = nn.Embedding(vocab_size , embd_size)
+        self.position_embedding_table = nn.Embedding(block_size , embd_size)
+        self.lm_head = nn.Linear(embd_size , vocab_size)
+
     def forward(self, idx , targets = None):
         
         # idx and targets bring B, T and the embedding table brings the dimension C
-        logits = self.token_embedding_table(idx) # B, T, C
-            
+        tok_emb = self.token_embedding_table(idx) # B, T, embd_size
+        pos_emb = self.position_embedding_table(torch.arange(block_size , device = device)) # T, embd_size
+        final_emb = tok_emb + pos_emb # B, T, embd_size
+        logits = self.lm_head(final_emb)
         if targets is None :
             loss = None 
         else :
@@ -124,5 +131,5 @@ for iter in range(max_iters):
     optimizer.step()
     
 # Sampling from the model
-context = torch.zeros((1,1) , dtype = torch.long)
+context = torch.zeros((1,1) , dtype = torch.long , device = device)
 print (decode(model.generate(context , max_tokens = 300)[0].tolist()))
