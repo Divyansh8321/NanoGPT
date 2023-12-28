@@ -30,14 +30,17 @@ cv_data = data[:n1]
 
 torch.manual_seed(47)
 # hyperparameters
-block_size = 8 # This is the length of the chunk trained on ; can also be called context_length
-batch_size = 4 # This is the number of such chunks trained on in parallel
-max_iters = 10000 # This is the number of steps after which the training is stopped
-lr = 1e-3 # This is the learning rate of the model
+block_size = 64 # This is the length of the chunk trained on ; can also be called context_length
+batch_size = 256 # This is the number of such chunks trained on in parallel
+max_iters = 5000 # This is the number of steps after which the training is stopped
+lr = 1e-4 # This is the learning rate of the model
 eval_iters = 100 # This is the number of steps for which the model is evaluated on the cross-val set
-eval_interval = 100 # This is the interval after which the model is evaluated on the cross-val set
+eval_interval = 500 # This is the interval after which the model is evaluated on the cross-val set
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-embd_size = 32 # This is the size of the embedding vector
+embd_size = 384 # This is the size of the embedding vector
+head_size = 6 # This is the size of the attention head
+n_layers = 6 # This is the number of layers in the transformer
+dropout = 0.2 # This is the dropout rate
 
 
 # This function will return a random batch of data of size batch_size and block_size
@@ -65,6 +68,79 @@ def estimate_loss():
     model.train()
     return out
 
+class Head(nn.Module):
+    """One head of the multi-head attention block"""
+
+    def __init__(self , head_size):
+        super().__init__()
+        self.query = nn.Linear(embd_size , head_size , bias = False)
+        self.key = nn.Linear(embd_size , head_size , bias = False)
+        self.value = nn.Linear(embd_size , head_size,  bias = False)
+        self.register_buffer('tril' , torch.tril(torch.ones((block_size , block_size))))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B,T,C = x.shape
+        q = self.query(x)
+        k = self.key(x)
+        
+        # q and  k  are B,T,head_size
+        # compute the scaled dot product attention
+        wei = q @ k.transpose(-2,-1) * (head_size)** (-0.5) # (B, T, head_size) @ (B, head_size, T) --> (B, T , T)
+        # mask the upper triangular part of the matrix
+        wei = wei.masked_fill(self.tril[:T,:T]==0 , float('-inf'))
+        # apply softmax to get the affinity matrix
+        wei = F.softmax(wei , dim = 1)
+        # Aggregate the values from every character in the sequence
+        v = self.value(x)
+        # Adding dropout 
+        wei = self.dropout(wei)
+
+        out = wei @ v # (B, T, T) @ (B, T, head_size) --> (B, T, head_size)
+        return out 
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self , num_heads , head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(embd_size , embd_size) # This is the projection layer which will project the output of the heads back to the original dimension
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x is B, T, C
+        # concatenate the output of each head
+        out = torch.cat([head(x) for head in self.heads] , dim = -1)
+        out = self.dropout((self.proj(out)))
+        return out 
+
+class FeedForward(nn.Module):
+    """A linear layer followed by a non-linear activation"""
+    # This is on a per token level and all the tokens do this independantly
+    def __init__(self , embd_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embd_size ,4 * embd_size),
+            nn.ReLU(),
+            nn.Linear(4 * embd_size , embd_size), # Projecting back to the original dimension
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+    
+class Block(nn.Module):
+    """Transformer block : Communication followed by computatiton"""
+    def __init__(self, embd_size , num_heads):
+        super().__init__()
+        self.attention = MultiHeadAttention(num_heads , embd_size//num_heads)
+        self.ffwd = FeedForward(embd_size)
+        self.ln1 = nn.LayerNorm(embd_size)
+        self.ln2 = nn.LayerNorm(embd_size)
+    
+    def forward(self, x):
+        x = x + self.attention(self.ln1(x)) # The x = x + represents the skip connection which allows the gradient to flow unimpeded initially 
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
 # We will start off with the simplest model which is Bigram Language Model
 class BigramLanguageModel(nn.Module):
@@ -73,15 +149,21 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size , embd_size)
         self.position_embedding_table = nn.Embedding(block_size , embd_size)
+        self.blocks = nn.Sequential(
+            *[Block(embd_size , head_size = head_size) for _ in range(n_layers)]
+        )
         self.lm_head = nn.Linear(embd_size , vocab_size)
 
     def forward(self, idx , targets = None):
         
+        B,T = idx.shape
         # idx and targets bring B, T and the embedding table brings the dimension C
         tok_emb = self.token_embedding_table(idx) # B, T, embd_size
-        pos_emb = self.position_embedding_table(torch.arange(block_size , device = device)) # T, embd_size
-        final_emb = tok_emb + pos_emb # B, T, embd_size
-        logits = self.lm_head(final_emb)
+        pos_emb = self.position_embedding_table(torch.arange(T , device = device)) # T, embd_size
+        x = tok_emb + pos_emb # B, T, embd_size
+        x = self.saheads(x) # B, T, embd_size
+        x = self.ffwd(x) # B, T, embd_size
+        logits = self.lm_head(x) # B, T, C
         if targets is None :
             loss = None 
         else :
@@ -94,14 +176,15 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, idx, max_tokens): # This will sort of do the next word prediction till it generates
     # max_tokens 
-    
         for _ in range(max_tokens):
+            # cropping idx to ensure that the context does not exceed the block_size 
+            idx_cond = idx[:,-block_size:]
             # idx is B, T
-            logits , _ = self(idx)
+            logits , loss = self(idx_cond)
             # focusing only on the last time step 
             logits = logits[: , -1 , :] # becomes B, C 
             # applyig softmax 
-            probs = F.softmax(logits , dim = 1) # also B, C
+            probs = F.softmax(logits , dim = -1) # also B, C
             # predict the next character in the sequence 
             idx_next = torch.multinomial(probs , num_samples = 1) # B, 1
             # append the predicted the character to the current sequence 
@@ -112,7 +195,7 @@ model = BigramLanguageModel()
 model = model.to(device)
 
 # create the learning rate optimizer 
-optimizer = torch.optim.AdamW(model.parameters() , lr = 1e-3)
+optimizer = torch.optim.AdamW(model.parameters() , lr = lr)
 
 # Gradient descent 
 for iter in range(max_iters):
